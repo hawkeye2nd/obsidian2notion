@@ -7,6 +7,21 @@ const { uploadFileToS3 } = require('./src/s3');
 const { findMarkdownFiles } = require('./src/utils');
 const config = require('./config');
 
+const STATE_FILE = path.join(__dirname, '.sync-state.json');
+
+async function loadState() {
+    try {
+        const raw = await fs.readFile(STATE_FILE, 'utf8');
+        return JSON.parse(raw);
+    } catch {
+        return { lastSync: null, pages: {} };
+    }
+}
+
+async function saveState(state) {
+    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+}
+
 /**
  * Parses YAML frontmatter from markdown content.
  */
@@ -402,15 +417,36 @@ async function processAllMarkdown() {
             return;
         }
 
+        const state = await loadState();
         const existingPages = await fetchAllExistingPages();
 
-        console.log(`\nFound ${allFiles.length} local files. Starting sync with concurrency of ${config.concurrencyLimit}...\n`);
+        // Filter to only files that are new or changed since last sync
+        const lastSync = state.lastSync ? new Date(state.lastSync) : null;
+        let filesToProcess = allFiles;
 
-        for (let i = 0; i < allFiles.length; i += config.concurrencyLimit) {
-            const batch = allFiles.slice(i, i + config.concurrencyLimit);
+        if (lastSync) {
+            filesToProcess = [];
+            for (const filePath of allFiles) {
+                const stat = await fs.stat(filePath);
+                const mtime = new Date(stat.mtime);
+                if (mtime > lastSync) {
+                    filesToProcess.push(filePath);
+                }
+            }
+            console.log(`\nIncremental sync: ${filesToProcess.length} changed files out of ${allFiles.length} total.\n`);
+        } else {
+            console.log(`\nFirst sync: processing all ${allFiles.length} files.\n`);
+        }
+
+        for (let i = 0; i < filesToProcess.length; i += config.concurrencyLimit) {
+            const batch = filesToProcess.slice(i, i + config.concurrencyLimit);
             const promises = batch.map(filePath => processSingleFile(filePath, existingPages));
             await Promise.all(promises);
         }
+
+        // Update lastSync timestamp
+        state.lastSync = new Date().toISOString();
+        await saveState(state);
 
         console.log('\nAll files processed! 🚀');
     } catch (error) {

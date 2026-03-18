@@ -20,44 +20,46 @@ async function callWithRetry(apiCall, retries = 5) {
         try {
             return await apiCall();
         } catch (error) {
-            // Check for rate limits, conflicts, or any 5xx server errors
             if (error.code === 'conflict_error' || error.code === 'rate_limited' || (error.status && error.status >= 500)) {
                 attempt++;
                 if (attempt >= retries) {
-                    throw error; // Rethrow the error after the last attempt
+                    throw error;
                 }
-                const waitTime = Math.pow(2, attempt) * 1000; // Increased base wait time
+                const waitTime = Math.pow(2, attempt) * 1000;
                 console.log(`  ... Notion API error (${error.status || error.code}). Retrying in ${waitTime/1000}s (Attempt ${attempt}/${retries-1})`);
                 await delay(waitTime);
             } else {
-                throw error; // Rethrow other errors immediately
+                throw error;
             }
         }
     }
 }
 
 /**
- * Recursively finds all Markdown files in a directory.
+ * Recursively finds all Markdown files in a directory, skipping hidden folders (starting with '.').
  * @param {string} dir - The directory to search.
  * @returns {Promise<string[]>} A list of absolute paths to Markdown files.
  */
 async function findMarkdownFiles(dir) {
-  let markdownFiles = [];
-  try {
-    const items = await fs.readdir(dir);
-    for (const item of items) {
-      const fullPath = path.join(dir, item);
-      const stat = await fs.stat(fullPath);
-      if (stat.isDirectory()) {
-        markdownFiles = markdownFiles.concat(await findMarkdownFiles(fullPath));
-      } else if (path.extname(item).toLowerCase() === '.md') {
-        markdownFiles.push(fullPath);
-      }
+    let markdownFiles = [];
+    try {
+        const items = await fs.readdir(dir);
+        for (const item of items) {
+            // Skip hidden folders and files
+            if (item.startsWith('.')) continue;
+
+            const fullPath = path.join(dir, item);
+            const stat = await fs.stat(fullPath);
+            if (stat.isDirectory()) {
+                markdownFiles = markdownFiles.concat(await findMarkdownFiles(fullPath));
+            } else if (path.extname(item).toLowerCase() === '.md') {
+                markdownFiles.push(fullPath);
+            }
+        }
+    } catch (error) {
+        console.error(`Error reading directory ${dir}: ${error.message}`);
     }
-  } catch (error) {
-    console.error(`Error reading directory ${dir}: ${error.message}`);
-  }
-  return markdownFiles;
+    return markdownFiles;
 }
 
 module.exports = {

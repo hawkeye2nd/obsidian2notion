@@ -2,13 +2,34 @@ require('dotenv').config();
 const { markdownToBlocks } = require('@tryfabric/martian');
 const fs = require('fs/promises');
 const path = require('path');
-const { getOrCreatePageForPath, fetchAllExistingPages, notion, callWithRetry } = require('./src/notion');
+const { getOrCreateDatabaseForPath, ensureDatabaseProperties, fetchAllExistingPages, notion, callWithRetry } = require('./src/notion');
 const { uploadFileToS3 } = require('./src/s3');
 const { findMarkdownFiles } = require('./src/utils');
 const config = require('./config');
 
 /**
- * Resolves the full path of an image, supporting both relative paths and a global attachments folder.
+ * Parses YAML frontmatter from markdown content.
+ * Returns { frontmatter: {}, body: '' }
+ */
+function parseFrontmatter(content) {
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+    if (!match) return { frontmatter: {}, body: content };
+
+    const frontmatter = {};
+    const lines = match[1].split(/\r?\n/);
+    for (const line of lines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx === -1) continue;
+        const key = line.slice(0, colonIdx).trim();
+        const value = line.slice(colonIdx + 1).trim();
+        if (key) frontmatter[key] = value;
+    }
+
+    return { frontmatter, body: match[2] };
+}
+
+/**
+ * Resolves the full path of an image.
  */
 async function resolveImagePath(imagePath, markdownFilePath) {
     const decodedPath = decodeURIComponent(imagePath);
@@ -30,12 +51,13 @@ async function resolveImagePath(imagePath, markdownFilePath) {
 }
 
 /**
- * Processes a single markdown file and creates a Notion page under the appropriate folder page.
+ * Processes a single markdown file and creates a Notion page with frontmatter as properties.
  */
 async function processSingleFile(filePath, existingPages) {
     const pageTitle = path.basename(filePath, '.md');
     const relativePath = path.dirname(path.relative(config.markdownBaseDir, filePath));
-    const pageKey = relativePath === '.' ? pageTitle : `${relativePath.replace(/\\/g, '/')}/${pageTitle}`;
+    const dbTitle = relativePath === '.' ? config.rootDatabaseName : relativePath;
+    const pageKey = `${dbTitle}/${pageTitle}`;
 
     if (existingPages.has(pageKey)) {
         console.log(`⏭️  Skipping (already exists): ${pageTitle}`);
@@ -43,11 +65,20 @@ async function processSingleFile(filePath, existingPages) {
     }
 
     try {
-        const parentPageId = await getOrCreatePageForPath(relativePath);
+        const databaseId = await getOrCreateDatabaseForPath(relativePath);
 
         console.log(`Processing: ${pageTitle}`);
-        let markdownContent = await fs.readFile(filePath, 'utf8');
+        const rawContent = await fs.readFile(filePath, 'utf8');
+        const { frontmatter, body } = parseFrontmatter(rawContent);
+        let markdownContent = body;
 
+        // Ensure all frontmatter keys exist as properties in the database
+        const frontmatterKeys = Object.keys(frontmatter);
+        if (frontmatterKeys.length > 0) {
+            await ensureDatabaseProperties(databaseId, frontmatterKeys);
+        }
+
+        // Handle attachments
         const attachmentRegex = /!\[(.*?)\]\((?!https?:\/\/)(.*?)\)|!\[\[(.*?)(?:\|.*?)?\]\]/g;
         const attachmentMatches = [...markdownContent.matchAll(attachmentRegex)];
 
@@ -101,6 +132,8 @@ async function processSingleFile(filePath, existingPages) {
         }
 
         const notionBlocks = markdownToBlocks(markdownContent);
+        const stats = await fs.stat(filePath);
+        const creationDate = stats.birthtime.toISOString().split('T')[0];
 
         const firstChunk = notionBlocks.slice(0, 100);
         const remainingChunks = [];
@@ -108,23 +141,26 @@ async function processSingleFile(filePath, existingPages) {
             remainingChunks.push(notionBlocks.slice(i, i + 100));
         }
 
-        const newPage = await callWithRetry(() =>
-            notion.pages.create({
-                parent: { page_id: parentPageId },
-                properties: {
-                    title: [{ text: { content: pageTitle } }],
-                },
-                children: firstChunk,
-            })
-        );
+        // Build properties object: Name + Created Date + all frontmatter
+        const properties = {
+            'Name': { title: [{ text: { content: pageTitle } }] },
+            'Created Date': { date: { start: creationDate } },
+        };
+        for (const [key, value] of Object.entries(frontmatter)) {
+            properties[key] = { rich_text: [{ text: { content: String(value) } }] };
+        }
+
+        const newPage = await callWithRetry(() => notion.pages.create({
+            parent: { database_id: databaseId },
+            properties,
+            children: firstChunk,
+        }));
 
         for (const chunk of remainingChunks) {
-            await callWithRetry(() =>
-                notion.blocks.children.append({
-                    block_id: newPage.id,
-                    children: chunk,
-                })
-            );
+            await callWithRetry(() => notion.blocks.children.append({
+                block_id: newPage.id,
+                children: chunk,
+            }));
         }
 
         console.log(`✅ Synced: ${pageTitle}`);

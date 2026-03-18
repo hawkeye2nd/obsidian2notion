@@ -1,97 +1,130 @@
-const path = require('path');
 const { Client } = require('@notionhq/client');
 const { callWithRetry } = require('./utils');
 
 const notion = new Client({ auth: process.env.NOTION_KEY });
 
-const pageCache = new Map();
+const databasePromiseCache = new Map();
+const databasePropertyCache = new Map();
 
 /**
- * Gets or creates a folder page under a given parent.
+ * Creates a new Notion database inside the parent page.
  */
-async function getOrCreateFolderPage(title, parentPageId) {
-    const cacheKey = `${parentPageId}/${title}`;
-    if (pageCache.has(cacheKey)) {
-        return pageCache.get(cacheKey);
-    }
-
-    // Check if page already exists under parent
-    const response = await callWithRetry(() =>
-        notion.blocks.children.list({ block_id: parentPageId })
-    );
-    const existing = response.results.find(
-        block => block.type === 'child_page' && block.child_page.title === title
-    );
-
-    if (existing) {
-        console.log(`  Found existing folder page: "${title}"`);
-        pageCache.set(cacheKey, existing.id);
-        return existing.id;
-    }
-
-    // Create new folder page
-    console.log(`  Creating new folder page: "${title}"`);
-    const newPage = await callWithRetry(() =>
-        notion.pages.create({
-            parent: { page_id: parentPageId },
-            properties: {
-                title: [{ text: { content: title } }],
-            },
-        })
-    );
-
-    pageCache.set(cacheKey, newPage.id);
-    return newPage.id;
+async function createNotionDatabase(title) {
+    console.log(`  Creating new Notion database titled: "${title}"`);
+    const response = await callWithRetry(() => notion.databases.create({
+        parent: { page_id: process.env.NOTION_PARENT_PAGE_ID },
+        title: [{ type: 'text', text: { content: title } }],
+        properties: {
+            'Name': { title: {} },
+            'Created Date': { date: {} },
+        },
+    }));
+    databasePropertyCache.set(response.id, new Set(['Name', 'Created Date']));
+    return response.id;
 }
 
 /**
- * Resolves the parent page ID for a given relative path, creating folder pages as needed.
- * @param {string} relativePath - e.g. '.' for root, 'Characters' or 'Characters\Heroes' for nested
+ * Ensures a database has all required properties, adding any that are missing as rich_text.
  */
-async function getOrCreatePageForPath(relativePath) {
-    if (relativePath === '.') {
-        return process.env.NOTION_PARENT_PAGE_ID;
+async function ensureDatabaseProperties(databaseId, requiredProps) {
+    if (!databasePropertyCache.has(databaseId)) {
+        const db = await callWithRetry(() => notion.databases.retrieve({ database_id: databaseId }));
+        databasePropertyCache.set(databaseId, new Set(Object.keys(db.properties)));
     }
 
-    const parts = relativePath.split(path.sep);
-    let currentParentId = process.env.NOTION_PARENT_PAGE_ID;
+    const existingProps = databasePropertyCache.get(databaseId);
+    const missingProps = requiredProps.filter(p => !existingProps.has(p));
 
-    for (const part of parts) {
-        currentParentId = await getOrCreateFolderPage(part, currentParentId);
+    if (missingProps.length === 0) return;
+
+    console.log(`  Adding new properties to database: ${missingProps.join(', ')}`);
+    const newProperties = {};
+    for (const prop of missingProps) {
+        newProperties[prop] = { rich_text: {} };
     }
 
-    return currentParentId;
+    await callWithRetry(() => notion.databases.update({
+        database_id: databaseId,
+        properties: newProperties,
+    }));
+
+    for (const prop of missingProps) {
+        existingProps.add(prop);
+    }
 }
 
 /**
- * Traverses the page hierarchy and returns a set of existing page paths.
+ * Gets the ID of a Notion database for a given path, creating it if it doesn't exist.
+ */
+function getOrCreateDatabaseForPath(relativePath) {
+    const dbTitle = relativePath === '.' ? 'Root' : relativePath;
+
+    if (databasePromiseCache.has(dbTitle)) {
+        return databasePromiseCache.get(dbTitle);
+    }
+
+    const promise = (async () => {
+        const response = await callWithRetry(() =>
+            notion.blocks.children.list({ block_id: process.env.NOTION_PARENT_PAGE_ID })
+        );
+        const existingDb = response.results.find(
+            block => block.type === 'child_database' && block.child_database.title === dbTitle
+        );
+
+        if (existingDb) {
+            console.log(`  Found existing database for path: "${dbTitle}"`);
+            return existingDb.id;
+        } else {
+            return await createNotionDatabase(dbTitle);
+        }
+    })();
+
+    databasePromiseCache.set(dbTitle, promise);
+    return promise;
+}
+
+/**
+ * Fetches all pages from all databases under the parent page and returns a set of unique keys.
  */
 async function fetchAllExistingPages() {
     console.log('Fetching all existing pages from Notion to speed up sync...');
     const existingKeys = new Set();
 
-    async function traverse(pageId, pathPrefix) {
-        const response = await callWithRetry(() =>
-            notion.blocks.children.list({ block_id: pageId })
-        );
-        for (const block of response.results) {
-            if (block.type === 'child_page') {
-                const title = block.child_page.title;
-                const fullPath = pathPrefix ? `${pathPrefix}/${title}` : title;
-                existingKeys.add(fullPath);
-                await traverse(block.id, fullPath);
+    const dbsResponse = await callWithRetry(() =>
+        notion.blocks.children.list({ block_id: process.env.NOTION_PARENT_PAGE_ID })
+    );
+    const databaseBlocks = dbsResponse.results.filter(block => block.type === 'child_database');
+
+    for (const dbBlock of databaseBlocks) {
+        const dbTitle = dbBlock.child_database.title;
+        const dbId = dbBlock.id;
+        let nextCursor = undefined;
+
+        do {
+            const response = await notion.databases.query({
+                database_id: dbId,
+                start_cursor: nextCursor,
+                page_size: 100,
+            });
+
+            for (const page of response.results) {
+                const pageTitle = page.properties.Name?.title?.[0]?.plain_text;
+                if (pageTitle) {
+                    existingKeys.add(`${dbTitle}/${pageTitle}`);
+                }
             }
-        }
+            nextCursor = response.next_cursor;
+        } while (nextCursor);
     }
 
-    await traverse(process.env.NOTION_PARENT_PAGE_ID, '');
-    console.log(`Found ${existingKeys.size} existing pages.`);
+    console.log(`Found ${existingKeys.size} existing pages across ${databaseBlocks.length} databases.`);
     return existingKeys;
 }
 
 module.exports = {
     notion,
-    getOrCreatePageForPath,
+    getOrCreateDatabaseForPath,
+    ensureDatabaseProperties,
     callWithRetry,
     fetchAllExistingPages,
 };

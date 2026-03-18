@@ -3,16 +3,11 @@ const path = require('path');
 
 /**
  * A utility function to add a delay.
- * @param {number} ms - The number of milliseconds to wait.
- * @returns {Promise<void>}
  */
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * A wrapper for Notion API calls to handle rate limiting, conflicts, and temporary server errors (like 502).
- * @param {Function} apiCall - The Notion API function to call.
- * @param {number} retries - The number of retries to attempt.
- * @returns {Promise<any>} The result of the API call.
+ * A wrapper for Notion API calls to handle rate limiting, conflicts, and temporary server errors.
  */
 async function callWithRetry(apiCall, retries = 5) {
     let attempt = 0;
@@ -22,9 +17,7 @@ async function callWithRetry(apiCall, retries = 5) {
         } catch (error) {
             if (error.code === 'conflict_error' || error.code === 'rate_limited' || (error.status && error.status >= 500)) {
                 attempt++;
-                if (attempt >= retries) {
-                    throw error;
-                }
+                if (attempt >= retries) throw error;
                 const waitTime = Math.pow(2, attempt) * 1000;
                 console.log(`  ... Notion API error (${error.status || error.code}). Retrying in ${waitTime/1000}s (Attempt ${attempt}/${retries-1})`);
                 await delay(waitTime);
@@ -37,15 +30,12 @@ async function callWithRetry(apiCall, retries = 5) {
 
 /**
  * Recursively finds all Markdown files in a directory, skipping hidden folders (starting with '.').
- * @param {string} dir - The directory to search.
- * @returns {Promise<string[]>} A list of absolute paths to Markdown files.
  */
 async function findMarkdownFiles(dir) {
     let markdownFiles = [];
     try {
         const items = await fs.readdir(dir);
         for (const item of items) {
-            // Skip hidden folders and files
             if (item.startsWith('.')) continue;
 
             const fullPath = path.join(dir, item);

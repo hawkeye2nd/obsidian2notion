@@ -29,14 +29,18 @@ async function callWithRetry(apiCall, retries = 5) {
 }
 
 /**
- * Recursively finds all Markdown files in a directory, skipping hidden folders (starting with '.').
+ * Recursively finds all Markdown files in a directory.
+ * Skips hidden folders (starting with '.') and any folders in config.excludedFolders.
  */
 async function findMarkdownFiles(dir) {
+    const config = require('./config');
+    const excluded = config.excludedFolders || [];
     let markdownFiles = [];
     try {
         const items = await fs.readdir(dir);
         for (const item of items) {
             if (item.startsWith('.')) continue;
+            if (excluded.includes(item)) continue;
 
             const fullPath = path.join(dir, item);
             const stat = await fs.stat(fullPath);

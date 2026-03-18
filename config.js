@@ -2,7 +2,7 @@ const path = require('path');
 
 module.exports = {
   // The base directory for your markdown files
-markdownBaseDir: path.join('C:\\Users\\A\\Documents\\Verse'),
+  markdownBaseDir: 'C:\\Users\\A\\Documents\\Verse',
 
   // The name of the folder where global attachments are stored
   attachmentsDir: 'Attachments',

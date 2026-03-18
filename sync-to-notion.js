@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const { markdownToBlocks } = require('@tryfabric/martian');
 const fs = require('fs/promises');
 const path = require('path');
@@ -9,12 +10,14 @@ const config = require('./config');
 
 const STATE_FILE = path.join(__dirname, '.sync-state.json');
 
+// ─── State Management ─────────────────────────────────────────────────────────
+
 async function loadState() {
     try {
         const raw = await fs.readFile(STATE_FILE, 'utf8');
         return JSON.parse(raw);
     } catch {
-        return { lastSync: null, pages: {} };
+        return { pages: {} };
     }
 }
 
@@ -22,9 +25,12 @@ async function saveState(state) {
     await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
 }
 
-/**
- * Parses YAML frontmatter from markdown content.
- */
+function hashContent(content) {
+    return crypto.createHash('md5').update(content).digest('hex');
+}
+
+// ─── Frontmatter ──────────────────────────────────────────────────────────────
+
 function parseFrontmatter(content) {
     const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
     if (!match) return { frontmatter: {}, body: content };
@@ -42,9 +48,6 @@ function parseFrontmatter(content) {
     return { frontmatter, body: match[2] };
 }
 
-/**
- * Builds a callout block from frontmatter key/value pairs.
- */
 function buildFrontmatterCallout(frontmatter) {
     const entries = Object.entries(frontmatter);
     if (entries.length === 0) return null;
@@ -60,9 +63,8 @@ function buildFrontmatterCallout(frontmatter) {
     };
 }
 
-/**
- * Normalizes all markdown tables so every row has the same number of columns as the header.
- */
+// ─── Table Sanitization ───────────────────────────────────────────────────────
+
 function sanitizeTables(markdown) {
     const lines = markdown.split(/\r?\n/);
     const result = [];
@@ -94,22 +96,21 @@ function sanitizeTables(markdown) {
     return result.join('\n');
 }
 
-/**
- * Strips all markdown tables, replacing them with a notice.
- */
 function tablesToCodeBlock(markdown) {
     const lines = markdown.split(/\r?\n/);
     const result = [];
     let i = 0;
-    let stripped = false;
 
     while (i < lines.length) {
         if (lines[i].includes('|')) {
-            while (i < lines.length && lines[i].includes('|')) i++;
-            if (!stripped) {
-                result.push('```');
-                stripped = true;
+            const tableLines = [];
+            while (i < lines.length && lines[i].includes('|')) {
+                tableLines.push(lines[i]);
+                i++;
             }
+            result.push('```');
+            result.push(...tableLines);
+            result.push('```');
         } else {
             result.push(lines[i]);
             i++;
@@ -119,39 +120,34 @@ function tablesToCodeBlock(markdown) {
     return result.join('\n');
 }
 
-/**
- * Recursively sanitizes Notion blocks to comply with API limits:
- * - Max 3 levels of bullet nesting (deeper levels flattened with → prefix)
- * - Max 100 children per block
- * - Max 100 rich_text segments per paragraph (splits into multiple paragraphs)
- */
+// ─── Block Sanitization ───────────────────────────────────────────────────────
+
 function sanitizeBlocks(blocks, depth = 0) {
     const result = [];
-    const MAX_DEPTH = 2; // Notion allows 3 levels (0, 1, 2) but level 2 cannot have children
+    const MAX_DEPTH = 2;
     const MAX_CHILDREN = 100;
     const MAX_RICH_TEXT = 100;
     const MAX_EQUATION = 2000;
 
+    const textToCodeBlocks = (text) => {
+        const chunks = [];
+        for (let i = 0; i < text.length; i += MAX_EQUATION) {
+            chunks.push({
+                object: 'block',
+                type: 'code',
+                code: {
+                    language: 'plain text',
+                    rich_text: [{ type: 'text', text: { content: text.slice(i, i + MAX_EQUATION) } }],
+                },
+            });
+        }
+        return chunks;
+    };
+
     for (const block of blocks) {
         const type = block.type;
 
-        // Helper: convert a long string to one or more code blocks (2000 char limit each)
-        const textToCodeBlocks = (text) => {
-            const chunks = [];
-            for (let i = 0; i < text.length; i += MAX_EQUATION) {
-                chunks.push({
-                    object: 'block',
-                    type: 'code',
-                    code: {
-                        language: 'plain text',
-                        rich_text: [{ type: 'text', text: { content: text.slice(i, i + MAX_EQUATION) } }],
-                    },
-                });
-            }
-            return chunks;
-        };
-
-        // If any inline equation in this block is too long, convert whole block to code block(s)
+        // Inline equation overflow → convert block to code block(s)
         if (block[type]?.rich_text) {
             const hasOversizedEquation = block[type].rich_text.some(
                 seg => seg.type === 'equation' && seg.equation?.expression?.length > MAX_EQUATION
@@ -166,13 +162,13 @@ function sanitizeBlocks(blocks, depth = 0) {
             }
         }
 
-        // Block-level equation too long - convert to code block(s)
+        // Block-level equation overflow → code block(s)
         if (type === 'equation' && block.equation?.expression?.length > MAX_EQUATION) {
             result.push(...textToCodeBlocks(block.equation.expression));
             continue;
         }
 
-        // Handle paragraph rich_text overflow - split into multiple paragraphs
+        // Paragraph rich_text overflow → split into multiple paragraphs
         if (type === 'paragraph' && block.paragraph?.rich_text?.length > MAX_RICH_TEXT) {
             const segments = block.paragraph.rich_text;
             for (let i = 0; i < segments.length; i += MAX_RICH_TEXT) {
@@ -185,10 +181,9 @@ function sanitizeBlocks(blocks, depth = 0) {
             continue;
         }
 
-        // Handle bulleted/numbered list nesting depth
+        // Bullet nesting depth exceeded → flatten with → prefix
         const listTypes = ['bulleted_list_item', 'numbered_list_item'];
         if (listTypes.includes(type) && depth >= MAX_DEPTH) {
-            // Flatten: prepend arrows to show original depth
             const arrows = depth > MAX_DEPTH ? '→'.repeat(depth - MAX_DEPTH + 1) + ' ' : '→ ';
             const originalText = block[type]?.rich_text?.[0]?.text?.content || '';
             result.push({
@@ -198,18 +193,16 @@ function sanitizeBlocks(blocks, depth = 0) {
                     rich_text: [{ type: 'text', text: { content: `${arrows}${originalText}` } }],
                 },
             });
-            // Recurse children at same capped depth so they also get flattened
             if (block[type]?.children?.length) {
                 result.push(...sanitizeBlocks(block[type].children, depth));
             }
             continue;
         }
 
-        // Recurse into children for non-list blocks or allowed depth list items
+        // Recurse into children
         if (block[type]?.children?.length) {
             const children = sanitizeBlocks(block[type].children, depth + 1);
             if (children.length > MAX_CHILDREN) {
-                // Keep first 100 as children, push overflow as siblings after this block
                 const kept = children.slice(0, MAX_CHILDREN);
                 const overflow = children.slice(MAX_CHILDREN);
                 result.push({ ...block, [type]: { ...block[type], children: kept } });
@@ -226,190 +219,185 @@ function sanitizeBlocks(blocks, depth = 0) {
     return result;
 }
 
-/**
- * Resolves the full path of an image.
- */
+// ─── Image Handling ───────────────────────────────────────────────────────────
+
 async function resolveImagePath(imagePath, markdownFilePath) {
     const decodedPath = decodeURIComponent(imagePath);
 
     const relativePath = path.resolve(path.dirname(markdownFilePath), decodedPath);
-    try {
-        await fs.access(relativePath);
-        return relativePath;
-    } catch (e) {}
+    try { await fs.access(relativePath); return relativePath; } catch (e) {}
 
     const attachmentPath = path.join(config.markdownBaseDir, config.attachmentsDir, decodedPath);
-    try {
-        await fs.access(attachmentPath);
-        return attachmentPath;
-    } catch (e) {}
+    try { await fs.access(attachmentPath); return attachmentPath; } catch (e) {}
 
     console.warn(`    ⚠️  Could not find image: ${decodedPath}`);
     return null;
 }
 
-/**
- * Appends blocks to an existing page (for folder notes).
- */
-async function appendBlocksToPage(pageId, blocks) {
-    const chunks = [];
-    for (let i = 0; i < blocks.length; i += 100) {
-        chunks.push(blocks.slice(i, i + 100));
+async function processAttachments(markdownContent, filePath) {
+    const attachmentRegex = /!\[(.*?)\]\((?!https?:\/\/)(.*?)\)|!\[\[(.*?)(?:\|.*?)?\]\]/g;
+    const attachmentMatches = [...markdownContent.matchAll(attachmentRegex)];
+    if (attachmentMatches.length === 0) return markdownContent;
+
+    const uploadPromises = attachmentMatches.map(match => (async () => {
+        const originalLinkText = match[0];
+        let altText = '', originalAttachmentPath = '';
+
+        if (match[2] !== undefined) { altText = match[1]; originalAttachmentPath = match[2]; }
+        else if (match[3] !== undefined) { originalAttachmentPath = match[3]; altText = path.basename(originalAttachmentPath); }
+        if (!originalAttachmentPath) return null;
+
+        try {
+            const fullPath = await resolveImagePath(originalAttachmentPath, filePath);
+            if (fullPath) {
+                const ext = path.extname(originalAttachmentPath).toLowerCase();
+                const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'].includes(ext);
+                const s3Url = await uploadFileToS3(fullPath);
+                if (s3Url) {
+                    if (isImage) return { original: originalLinkText, replacement: `![${altText}](${s3Url})` };
+                    const fileType = ext.replace('.', '').toUpperCase();
+                    return { original: originalLinkText, replacement: `[📎 ${altText || fileType + ' File'}](${s3Url})` };
+                }
+            }
+        } catch (e) {
+            console.error(`    ❌ ERROR processing attachment "${originalAttachmentPath}": ${e.message}`);
+        }
+        return null;
+    })());
+
+    const results = await Promise.all(uploadPromises);
+    for (const r of results) {
+        if (r) markdownContent = markdownContent.replace(r.original, r.replacement);
     }
-    for (const chunk of chunks) {
+    return markdownContent;
+}
+
+// ─── Build Notion Blocks ──────────────────────────────────────────────────────
+
+async function buildBlocks(filePath, rawContent) {
+    const { frontmatter, body } = parseFrontmatter(rawContent);
+    let markdownContent = sanitizeTables(body);
+    markdownContent = await processAttachments(markdownContent, filePath);
+
+    const callout = buildFrontmatterCallout(frontmatter);
+
+    async function toBlocks(md) {
+        return sanitizeBlocks(callout
+            ? [callout, ...markdownToBlocks(md)]
+            : markdownToBlocks(md)
+        );
+    }
+
+    try {
+        return await toBlocks(markdownContent);
+    } catch (err) {
+        if (err.message && err.message.includes('table')) {
+            console.warn(`  ⚠️  Table error, retrying with tables as code blocks...`);
+            return await toBlocks(tablesToCodeBlock(markdownContent));
+        }
+        throw err;
+    }
+}
+
+// ─── Notion Page Operations ───────────────────────────────────────────────────
+
+async function createPage(parentPageId, pageTitle, blocks) {
+    const firstChunk = blocks.slice(0, 100);
+    const remaining = [];
+    for (let i = 100; i < blocks.length; i += 100) remaining.push(blocks.slice(i, i + 100));
+
+    const newPage = await callWithRetry(() =>
+        notion.pages.create({
+            parent: { page_id: parentPageId },
+            properties: { title: [{ text: { content: pageTitle } }] },
+            children: firstChunk,
+        })
+    );
+
+    for (const chunk of remaining) {
         await callWithRetry(() =>
-            notion.blocks.children.append({ block_id: pageId, children: chunk })
+            notion.blocks.children.append({ block_id: newPage.id, children: chunk })
+        );
+    }
+
+    return newPage.id;
+}
+
+async function updatePage(pageId, blocks) {
+    // Delete all existing blocks
+    let cursor;
+    do {
+        const response = await callWithRetry(() =>
+            notion.blocks.children.list({ block_id: pageId, start_cursor: cursor, page_size: 100 })
+        );
+        await Promise.all(
+            response.results
+                .filter(b => b.type !== 'child_page') // never delete subpages
+                .map(b => callWithRetry(() => notion.blocks.delete({ block_id: b.id })))
+        );
+        cursor = response.next_cursor;
+    } while (cursor);
+
+    // Append new blocks
+    for (let i = 0; i < blocks.length; i += 100) {
+        await callWithRetry(() =>
+            notion.blocks.children.append({ block_id: pageId, children: blocks.slice(i, i + 100) })
         );
     }
 }
 
-/**
- * Processes a single markdown file and creates or updates a Notion page.
- * If the file is a folder note (same name as parent folder), its content
- * is written to the folder page itself instead of creating a child page.
- */
-async function processSingleFile(filePath, existingPages) {
+async function deletePage(pageId) {
+    await callWithRetry(() => notion.pages.update({ page_id: pageId, archived: true }));
+}
+
+// ─── Process Single File ──────────────────────────────────────────────────────
+
+async function processSingleFile(filePath, state) {
     const pageTitle = path.basename(filePath, '.md');
     const relativePath = path.dirname(path.relative(config.markdownBaseDir, filePath));
     const parentFolderName = relativePath === '.' ? null : path.basename(relativePath);
     const isFolderNote = parentFolderName && parentFolderName === pageTitle;
-    const pageKey = relativePath === '.' ? pageTitle : `${relativePath.replace(/\\/g, '/')}/${pageTitle}`;
-
-    if (existingPages.has(pageKey)) {
-        console.log(`⏭️  Skipping (already exists): ${pageTitle}`);
-        return;
-    }
 
     try {
-        console.log(`Processing: ${pageTitle}${isFolderNote ? ' (folder note)' : ''}`);
         const rawContent = await fs.readFile(filePath, 'utf8');
-        const { frontmatter, body } = parseFrontmatter(rawContent);
-        let markdownContent = sanitizeTables(body);
+        const hash = hashContent(rawContent);
+        const prev = state.pages[filePath];
 
-        // Handle attachments
-        const attachmentRegex = /!\[(.*?)\]\((?!https?:\/\/)(.*?)\)|!\[\[(.*?)(?:\|.*?)?\]\]/g;
-        const attachmentMatches = [...markdownContent.matchAll(attachmentRegex)];
-
-        if (attachmentMatches.length > 0) {
-            const uploadPromises = attachmentMatches.map(match => {
-                return (async () => {
-                    const originalLinkText = match[0];
-                    let altText = '';
-                    let originalAttachmentPath = '';
-
-                    if (match[2] !== undefined) {
-                        altText = match[1];
-                        originalAttachmentPath = match[2];
-                    } else if (match[3] !== undefined) {
-                        originalAttachmentPath = match[3];
-                        altText = path.basename(originalAttachmentPath);
-                    }
-
-                    if (!originalAttachmentPath) return null;
-
-                    try {
-                        const fullAttachmentPath = await resolveImagePath(originalAttachmentPath, filePath);
-                        if (fullAttachmentPath) {
-                            const fileExtension = path.extname(originalAttachmentPath).toLowerCase();
-                            const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'].includes(fileExtension);
-                            const s3Url = await uploadFileToS3(fullAttachmentPath);
-                            if (s3Url) {
-                                if (isImage) {
-                                    return { original: originalLinkText, replacement: `![${altText}](${s3Url})` };
-                                } else {
-                                    const fileType = fileExtension.replace('.', '').toUpperCase();
-                                    const displayName = altText || `${fileType} File`;
-                                    return { original: originalLinkText, replacement: `[📎 ${displayName}](${s3Url})` };
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        console.error(`    ❌ ERROR processing attachment "${originalAttachmentPath}": ${e.message}`);
-                    }
-                    return null;
-                })();
-            });
-
-            const uploadResults = await Promise.all(uploadPromises);
-            for (const result of uploadResults) {
-                if (result) markdownContent = markdownContent.replace(result.original, result.replacement);
-            }
+        if (prev && prev.hash === hash) {
+            process.stdout.write(`⏭️  `);
+            return; // unchanged
         }
 
-        const callout = buildFrontmatterCallout(frontmatter);
+        console.log(`${prev ? '🔄 Updating' : '➕ Creating'}: ${pageTitle}${isFolderNote ? ' (folder note)' : ''}`);
 
-        async function buildAndSendBlocks(md) {
-            const notionBlocks = sanitizeBlocks(markdownToBlocks(md));
-            return callout ? [callout, ...notionBlocks] : notionBlocks;
-        }
+        const blocks = await buildBlocks(filePath, rawContent);
 
         if (isFolderNote) {
-            // Write content onto the folder page itself
             const folderPageId = await getOrCreatePageForPath(relativePath);
-            try {
-                const blocks = await buildAndSendBlocks(markdownContent);
-                await appendBlocksToPage(folderPageId, blocks);
-            } catch (err) {
-                if (err.message && err.message.includes('table')) {
-                    console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
-                    const blocks = await buildAndSendBlocks(tablesToCodeBlock(markdownContent));
-                    await appendBlocksToPage(folderPageId, blocks);
-                } else {
-                    throw err;
-                }
-            }
+            await updatePage(folderPageId, blocks);
+            state.pages[filePath] = { hash, notionPageId: folderPageId, isFolderNote: true };
+        } else if (prev?.notionPageId) {
+            // Update existing page
+            await updatePage(prev.notionPageId, blocks);
+            state.pages[filePath] = { ...prev, hash };
         } else {
-            // Create a new child page under the parent
+            // Create new page
             const parentPageId = await getOrCreatePageForPath(relativePath);
-
-            async function tryCreatePage(md) {
-                const allBlocks = await buildAndSendBlocks(md);
-                const firstChunk = allBlocks.slice(0, 100);
-                const remainingChunks = [];
-                for (let i = 100; i < allBlocks.length; i += 100) {
-                    remainingChunks.push(allBlocks.slice(i, i + 100));
-                }
-
-                const newPage = await callWithRetry(() =>
-                    notion.pages.create({
-                        parent: { page_id: parentPageId },
-                        properties: {
-                            title: [{ text: { content: pageTitle } }],
-                        },
-                        children: firstChunk,
-                    })
-                );
-
-                for (const chunk of remainingChunks) {
-                    await callWithRetry(() =>
-                        notion.blocks.children.append({ block_id: newPage.id, children: chunk })
-                    );
-                }
-            }
-
-            try {
-                await tryCreatePage(markdownContent);
-            } catch (err) {
-                if (err.message && err.message.includes('table')) {
-                    console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
-                    await tryCreatePage(tablesToCodeBlock(markdownContent));
-                } else {
-                    throw err;
-                }
-            }
+            const pageId = await createPage(parentPageId, pageTitle, blocks);
+            state.pages[filePath] = { hash, notionPageId: pageId };
         }
 
-        console.log(`✅ Synced: ${pageTitle}`);
+        console.log(`✅ Done: ${pageTitle}`);
     } catch (error) {
         console.error(`❌ ERROR syncing "${pageTitle}": ${error.message}`);
     }
 }
 
-/**
- * Main function.
- */
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 async function processAllMarkdown() {
     try {
+        const fullSync = process.argv.includes('--full');
         const allFiles = await findMarkdownFiles(config.markdownBaseDir);
 
         if (allFiles.length === 0) {
@@ -418,33 +406,76 @@ async function processAllMarkdown() {
         }
 
         const state = await loadState();
-        const existingPages = await fetchAllExistingPages();
+        const isFirstSync = Object.keys(state.pages).length === 0;
 
-        // Filter to only files that are new or changed since last sync
-        const lastSync = state.lastSync ? new Date(state.lastSync) : null;
-        let filesToProcess = allFiles;
+        // Find deleted/renamed files (in state but no longer on disk)
+        const allFilesSet = new Set(allFiles);
+        const deletedFiles = Object.keys(state.pages).filter(f => !allFilesSet.has(f));
 
-        if (lastSync) {
-            filesToProcess = [];
+        if (deletedFiles.length > 0) {
+            console.log(`\nFound ${deletedFiles.length} deleted/renamed file(s) — removing from Notion...\n`);
+            for (const filePath of deletedFiles) {
+                const entry = state.pages[filePath];
+                if (entry?.notionPageId && !entry.isFolderNote) {
+                    try {
+                        await deletePage(entry.notionPageId);
+                        console.log(`🗑️  Deleted from Notion: ${path.basename(filePath, '.md')}`);
+                    } catch (e) {
+                        console.error(`❌ ERROR deleting "${filePath}": ${e.message}`);
+                    }
+                }
+                delete state.pages[filePath];
+            }
+        }
+
+        // On first sync or --full, verify against Notion to avoid duplicates
+        if (isFirstSync || fullSync) {
+            if (fullSync) console.log('--full flag: fetching existing pages from Notion...');
+            const existingPages = await fetchAllExistingPages();
+            // Mark already-existing pages so we don't recreate them
+            // (they'll be updated on next change)
             for (const filePath of allFiles) {
-                const stat = await fs.stat(filePath);
-                const mtime = new Date(stat.mtime);
-                if (mtime > lastSync) {
-                    filesToProcess.push(filePath);
+                const pageTitle = path.basename(filePath, '.md');
+                const relativePath = path.dirname(path.relative(config.markdownBaseDir, filePath));
+                const pageKey = relativePath === '.' ? pageTitle : `${relativePath.replace(/\\/g, '/')}/${pageTitle}`;
+                if (existingPages.has(pageKey) && !state.pages[filePath]) {
+                    // Page exists in Notion but we don't have it in state — record it as synced
+                    // We don't know the page ID without another API call, so just hash it
+                    // so it won't be re-uploaded unless it changes
+                    const rawContent = await fs.readFile(filePath, 'utf8').catch(() => null);
+                    if (rawContent) {
+                        state.pages[filePath] = { hash: hashContent(rawContent), notionPageId: null };
+                    }
                 }
             }
-            console.log(`\nIncremental sync: ${filesToProcess.length} changed files out of ${allFiles.length} total.\n`);
-        } else {
+        }
+
+        // Count files that need processing
+        let toProcess = 0;
+        for (const filePath of allFiles) {
+            const rawContent = await fs.readFile(filePath, 'utf8');
+            const hash = hashContent(rawContent);
+            if (!state.pages[filePath] || state.pages[filePath].hash !== hash) toProcess++;
+        }
+
+        if (isFirstSync) {
             console.log(`\nFirst sync: processing all ${allFiles.length} files.\n`);
+        } else {
+            console.log(`\nIncremental sync: ${toProcess} changed / ${allFiles.length} total.\n`);
         }
 
-        for (let i = 0; i < filesToProcess.length; i += config.concurrencyLimit) {
-            const batch = filesToProcess.slice(i, i + config.concurrencyLimit);
-            const promises = batch.map(filePath => processSingleFile(filePath, existingPages));
-            await Promise.all(promises);
+        if (toProcess === 0 && deletedFiles.length === 0) {
+            console.log('Nothing to sync. Run with --full to force a full check against Notion.');
+            await saveState(state);
+            return;
         }
 
-        // Update lastSync timestamp
+        // Process files with concurrency
+        for (let i = 0; i < allFiles.length; i += config.concurrencyLimit) {
+            const batch = allFiles.slice(i, i + config.concurrencyLimit);
+            await Promise.all(batch.map(filePath => processSingleFile(filePath, state)));
+        }
+
         state.lastSync = new Date().toISOString();
         await saveState(state);
 

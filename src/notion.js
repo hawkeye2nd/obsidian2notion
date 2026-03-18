@@ -26,6 +26,12 @@ function getOrCreateFolderPage(title, parentPageId) {
 
         if (existing) {
             console.log(`  Found existing folder page: "${title}"`);
+            // Unarchive if it was previously archived
+            const page = await callWithRetry(() => notion.pages.retrieve({ page_id: existing.id }));
+            if (page.archived) {
+                await callWithRetry(() => notion.pages.update({ page_id: existing.id, archived: false }));
+                console.log(`  Unarchived folder page: "${title}"`);
+            }
             return existing.id;
         }
 

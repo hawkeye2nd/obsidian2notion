@@ -82,7 +82,7 @@ function sanitizeTables(markdown) {
 /**
  * Strips all markdown tables, replacing them with a notice.
  */
-function stripTables(markdown) {
+function tablesToCodeBlock(markdown) {
     const lines = markdown.split(/\r?\n/);
     const result = [];
     let i = 0;
@@ -92,7 +92,7 @@ function stripTables(markdown) {
         if (lines[i].includes('|')) {
             while (i < lines.length && lines[i].includes('|')) i++;
             if (!stripped) {
-                result.push('> ⚠️ One or more tables were removed due to formatting issues.');
+                result.push('```');
                 stripped = true;
             }
         } else {
@@ -102,6 +102,113 @@ function stripTables(markdown) {
     }
 
     return result.join('\n');
+}
+
+/**
+ * Recursively sanitizes Notion blocks to comply with API limits:
+ * - Max 3 levels of bullet nesting (deeper levels flattened with → prefix)
+ * - Max 100 children per block
+ * - Max 100 rich_text segments per paragraph (splits into multiple paragraphs)
+ */
+function sanitizeBlocks(blocks, depth = 0) {
+    const result = [];
+    const MAX_DEPTH = 2; // Notion allows 3 levels (0, 1, 2) but level 2 cannot have children
+    const MAX_CHILDREN = 100;
+    const MAX_RICH_TEXT = 100;
+    const MAX_EQUATION = 2000;
+
+    for (const block of blocks) {
+        const type = block.type;
+
+        // Helper: convert a long string to one or more code blocks (2000 char limit each)
+        const textToCodeBlocks = (text) => {
+            const chunks = [];
+            for (let i = 0; i < text.length; i += MAX_EQUATION) {
+                chunks.push({
+                    object: 'block',
+                    type: 'code',
+                    code: {
+                        language: 'plain text',
+                        rich_text: [{ type: 'text', text: { content: text.slice(i, i + MAX_EQUATION) } }],
+                    },
+                });
+            }
+            return chunks;
+        };
+
+        // If any inline equation in this block is too long, convert whole block to code block(s)
+        if (block[type]?.rich_text) {
+            const hasOversizedEquation = block[type].rich_text.some(
+                seg => seg.type === 'equation' && seg.equation?.expression?.length > MAX_EQUATION
+            );
+            if (hasOversizedEquation) {
+                const text = block[type].rich_text.map(seg => {
+                    if (seg.type === 'equation') return seg.equation.expression;
+                    return seg.text?.content || '';
+                }).join('');
+                result.push(...textToCodeBlocks(text));
+                continue;
+            }
+        }
+
+        // Block-level equation too long - convert to code block(s)
+        if (type === 'equation' && block.equation?.expression?.length > MAX_EQUATION) {
+            result.push(...textToCodeBlocks(block.equation.expression));
+            continue;
+        }
+
+        // Handle paragraph rich_text overflow - split into multiple paragraphs
+        if (type === 'paragraph' && block.paragraph?.rich_text?.length > MAX_RICH_TEXT) {
+            const segments = block.paragraph.rich_text;
+            for (let i = 0; i < segments.length; i += MAX_RICH_TEXT) {
+                result.push({
+                    object: 'block',
+                    type: 'paragraph',
+                    paragraph: { rich_text: segments.slice(i, i + MAX_RICH_TEXT) },
+                });
+            }
+            continue;
+        }
+
+        // Handle bulleted/numbered list nesting depth
+        const listTypes = ['bulleted_list_item', 'numbered_list_item'];
+        if (listTypes.includes(type) && depth >= MAX_DEPTH) {
+            // Flatten: prepend arrows to show original depth
+            const arrows = depth > MAX_DEPTH ? '→'.repeat(depth - MAX_DEPTH + 1) + ' ' : '→ ';
+            const originalText = block[type]?.rich_text?.[0]?.text?.content || '';
+            result.push({
+                object: 'block',
+                type: 'bulleted_list_item',
+                bulleted_list_item: {
+                    rich_text: [{ type: 'text', text: { content: `${arrows}${originalText}` } }],
+                },
+            });
+            // Recurse children at same capped depth so they also get flattened
+            if (block[type]?.children?.length) {
+                result.push(...sanitizeBlocks(block[type].children, depth));
+            }
+            continue;
+        }
+
+        // Recurse into children for non-list blocks or allowed depth list items
+        if (block[type]?.children?.length) {
+            const children = sanitizeBlocks(block[type].children, depth + 1);
+            if (children.length > MAX_CHILDREN) {
+                // Keep first 100 as children, push overflow as siblings after this block
+                const kept = children.slice(0, MAX_CHILDREN);
+                const overflow = children.slice(MAX_CHILDREN);
+                result.push({ ...block, [type]: { ...block[type], children: kept } });
+                result.push(...overflow);
+                continue;
+            } else {
+                block[type].children = children;
+            }
+        }
+
+        result.push(block);
+    }
+
+    return result;
 }
 
 /**
@@ -217,7 +324,7 @@ async function processSingleFile(filePath, existingPages) {
         const callout = buildFrontmatterCallout(frontmatter);
 
         async function buildAndSendBlocks(md) {
-            const notionBlocks = markdownToBlocks(md);
+            const notionBlocks = sanitizeBlocks(markdownToBlocks(md));
             return callout ? [callout, ...notionBlocks] : notionBlocks;
         }
 
@@ -230,7 +337,7 @@ async function processSingleFile(filePath, existingPages) {
             } catch (err) {
                 if (err.message && err.message.includes('table')) {
                     console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
-                    const blocks = await buildAndSendBlocks(stripTables(markdownContent));
+                    const blocks = await buildAndSendBlocks(tablesToCodeBlock(markdownContent));
                     await appendBlocksToPage(folderPageId, blocks);
                 } else {
                     throw err;
@@ -270,7 +377,7 @@ async function processSingleFile(filePath, existingPages) {
             } catch (err) {
                 if (err.message && err.message.includes('table')) {
                     console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
-                    await tryCreatePage(stripTables(markdownContent));
+                    await tryCreatePage(tablesToCodeBlock(markdownContent));
                 } else {
                     throw err;
                 }

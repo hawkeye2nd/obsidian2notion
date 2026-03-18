@@ -70,18 +70,42 @@ async function fetchAllExistingPages() {
     console.log('Fetching all existing pages from Notion to speed up sync...');
     const existingKeys = new Set();
 
+    // Paginated fetch of all child blocks under a page
+    async function listAllChildren(pageId) {
+        const results = [];
+        let cursor = undefined;
+        do {
+            const response = await callWithRetry(() =>
+                notion.blocks.children.list({
+                    block_id: pageId,
+                    start_cursor: cursor,
+                    page_size: 100,
+                })
+            );
+            results.push(...response.results);
+            cursor = response.next_cursor;
+        } while (cursor);
+        return results;
+    }
+
+    // Traverse concurrently at each level instead of one-by-one
     async function traverse(pageId, pathPrefix) {
-        const response = await callWithRetry(() =>
-            notion.blocks.children.list({ block_id: pageId })
-        );
-        for (const block of response.results) {
-            if (block.type === 'child_page') {
-                const title = block.child_page.title;
-                const fullPath = pathPrefix ? `${pathPrefix}/${title}` : title;
-                existingKeys.add(fullPath);
-                await traverse(block.id, fullPath);
-            }
+        const blocks = await listAllChildren(pageId);
+        const childPages = blocks.filter(b => b.type === 'child_page');
+
+        // Register all pages at this level first
+        for (const block of childPages) {
+            const title = block.child_page.title;
+            const fullPath = pathPrefix ? `${pathPrefix}/${title}` : title;
+            existingKeys.add(fullPath);
         }
+
+        // Then recurse into all children concurrently
+        await Promise.all(childPages.map(block => {
+            const title = block.child_page.title;
+            const fullPath = pathPrefix ? `${pathPrefix}/${title}` : title;
+            return traverse(block.id, fullPath);
+        }));
     }
 
     await traverse(process.env.NOTION_PARENT_PAGE_ID, '');

@@ -1,36 +1,14 @@
 {
   "name": "notion-sync-backup-toolkit",
   "version": "1.0.0",
-  "description": "A comprehensive toolkit for syncing between Notion, markdown files, and managing your Notion workspace. Perfect for backing up Notion to Obsidian, syncing markdown files to Notion, and maintaining your knowledge base.",
+  "description": "A comprehensive toolkit for syncing between Notion, markdown files, and managing your Notion workspace.",
   "main": "sync-to-notion.js",
-  "keywords": [
-    "notion",
-    "obsidian", 
-    "markdown",
-    "backup",
-    "sync",
-    "knowledge-management",
-    "notion-api",
-    "documentation",
-    "migration",
-    "export"
-  ],
-  "author": "Charlie Blodgett",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/your-username/notion-sync-backup-toolkit.git"
-  },
-  "bugs": {
-    "url": "https://github.com/your-username/notion-sync-backup-toolkit/issues"
-  },
-  "homepage": "https://github.com/your-username/notion-sync-backup-toolkit#readme",
   "scripts": {
     "start": "node sync-to-notion.js",
-    "sync": "node sync-to-notion.js",
+    "sync": "node sync.js",
     "backup": "node notion-backup.js",
     "cleanup": "node notion-page-cleanup.js",
-    "help": "echo 'Available commands: npm run sync, npm run backup, npm run cleanup'"
+    "help": "echo 'Available commands: npm run sync (bidirectional), npm start (upload only), npm run backup (download only), npm run cleanup'"
   },
   "dependencies": {
     "@notionhq/client": "^2.2.14",

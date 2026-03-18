@@ -65,6 +65,13 @@ function buildFrontmatterCallout(frontmatter) {
 
 // ─── Table Sanitization ───────────────────────────────────────────────────────
 
+function countTableCols(row) {
+    // Count columns by splitting on | but not inside HTML tags like <br>
+    // Strip HTML tags first, then count pipes
+    const stripped = row.replace(/<[^>]+>/g, '');
+    return stripped.split('|').filter((_, idx, arr) => idx > 0 && idx < arr.length - 1).length;
+}
+
 function sanitizeTables(markdown) {
     const lines = markdown.split(/\r?\n/);
     const result = [];
@@ -72,16 +79,19 @@ function sanitizeTables(markdown) {
 
     while (i < lines.length) {
         const line = lines[i];
-        if (line.includes('|')) {
+        if (line.trim().startsWith('|')) {
             const tableLines = [];
-            while (i < lines.length && lines[i].includes('|')) {
+            while (i < lines.length && lines[i].trim().startsWith('|')) {
                 tableLines.push(lines[i]);
                 i++;
             }
-            const headerCells = tableLines[0].split('|').filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
-            const colCount = headerCells.length || 1;
+            // Use the first non-separator row to determine col count
+            const headerRow = tableLines[0];
+            const colCount = countTableCols(headerRow) || 1;
             for (const row of tableLines) {
-                const parts = row.split('|');
+                // Replace HTML tags that might contain pipes
+                const cleanRow = row.replace(/<[^>]+>/g, ' ');
+                const parts = cleanRow.split('|');
                 const inner = parts.slice(1, parts.length - 1);
                 while (inner.length < colCount) inner.push('');
                 const trimmed = inner.slice(0, colCount);
@@ -370,22 +380,42 @@ async function processSingleFile(filePath, state) {
 
         console.log(`${prev ? '🔄 Updating' : '➕ Creating'}: ${pageTitle}${isFolderNote ? ' (folder note)' : ''}`);
 
-        const blocks = await buildBlocks(filePath, rawContent);
-
-        if (isFolderNote) {
-            const folderPageId = await getOrCreatePageForPath(relativePath);
-            await updatePage(folderPageId, blocks);
-            state.pages[filePath] = { hash, notionPageId: folderPageId, isFolderNote: true };
-        } else if (prev?.notionPageId) {
-            // Update existing page
-            await updatePage(prev.notionPageId, blocks);
-            state.pages[filePath] = { ...prev, hash };
-        } else {
-            // Create new page
-            const parentPageId = await getOrCreatePageForPath(relativePath);
-            const pageId = await createPage(parentPageId, pageTitle, blocks);
-            state.pages[filePath] = { hash, notionPageId: pageId };
+        async function getBlocks(forceStripTables = false) {
+            const { frontmatter, body } = parseFrontmatter(rawContent);
+            let md = forceStripTables ? tablesToCodeBlock(body) : sanitizeTables(body);
+            md = await processAttachments(md, filePath);
+            const callout = buildFrontmatterCallout(frontmatter);
+            return sanitizeBlocks(callout ? [callout, ...markdownToBlocks(md)] : markdownToBlocks(md));
         }
+
+        async function syncBlocks(blocks, retry = true) {
+            try {
+                if (isFolderNote) {
+                    const folderPageId = await getOrCreatePageForPath(relativePath);
+                    await updatePage(folderPageId, blocks);
+                    state.pages[filePath] = { hash, notionPageId: folderPageId, isFolderNote: true };
+                } else if (prev?.notionPageId) {
+                    await updatePage(prev.notionPageId, blocks);
+                    state.pages[filePath] = { ...prev, hash };
+                } else {
+                    const parentPageId = await getOrCreatePageForPath(relativePath);
+                    const pageId = await createPage(parentPageId, pageTitle, blocks);
+                    state.pages[filePath] = { hash, notionPageId: pageId };
+                }
+            } catch (err) {
+                const errText = (err.message || '') + (err.body || '') + JSON.stringify(err.code || '');
+                if (retry && (errText.toLowerCase().includes('table') || errText.toLowerCase().includes('number of cells') || errText.toLowerCase().includes('content creation failed'))) {
+                    console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables as code blocks...`);
+                    const fallbackBlocks = await getBlocks(true);
+                    await syncBlocks(fallbackBlocks, false);
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        const blocks = await getBlocks();
+        await syncBlocks(blocks);
 
         console.log(`✅ Done: ${pageTitle}`);
     } catch (error) {

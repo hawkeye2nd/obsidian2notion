@@ -9,7 +9,6 @@ const config = require('./config');
 
 /**
  * Parses YAML frontmatter from markdown content.
- * Returns { frontmatter: {}, body: '' }
  */
 function parseFrontmatter(content) {
     const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
@@ -34,9 +33,7 @@ function parseFrontmatter(content) {
 function buildFrontmatterCallout(frontmatter) {
     const entries = Object.entries(frontmatter);
     if (entries.length === 0) return null;
-
     const text = entries.map(([k, v]) => `${k}: ${v}`).join('\n');
-
     return {
         object: 'block',
         type: 'callout',
@@ -49,27 +46,62 @@ function buildFrontmatterCallout(frontmatter) {
 }
 
 /**
- * Sanitizes markdown tables so all rows have the same number of columns as the header.
+ * Normalizes all markdown tables so every row has the same number of columns as the header.
  */
 function sanitizeTables(markdown) {
-    return markdown.replace(
-        /((?:\|.*\|\r?\n)+)/g,
-        (tableBlock) => {
-            const rows = tableBlock.trimEnd().split(/\r?\n/);
-            const headerCols = (rows[0].match(/\|/g) || []).length - 1;
-            if (headerCols <= 0) return tableBlock;
+    const lines = markdown.split(/\r?\n/);
+    const result = [];
+    let i = 0;
 
-            const sanitized = rows.map(row => {
-                const cells = row.split('|');
-                const inner = cells.slice(1, cells.length - 1);
-                while (inner.length < headerCols) inner.push('');
-                const trimmed = inner.slice(0, headerCols);
-                return '|' + trimmed.join('|') + '|';
-            });
-
-            return sanitized.join('\n') + '\n';
+    while (i < lines.length) {
+        const line = lines[i];
+        if (line.includes('|')) {
+            const tableLines = [];
+            while (i < lines.length && lines[i].includes('|')) {
+                tableLines.push(lines[i]);
+                i++;
+            }
+            const headerCells = tableLines[0].split('|').filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
+            const colCount = headerCells.length || 1;
+            for (const row of tableLines) {
+                const parts = row.split('|');
+                const inner = parts.slice(1, parts.length - 1);
+                while (inner.length < colCount) inner.push('');
+                const trimmed = inner.slice(0, colCount);
+                result.push('|' + trimmed.join('|') + '|');
+            }
+        } else {
+            result.push(line);
+            i++;
         }
-    );
+    }
+
+    return result.join('\n');
+}
+
+/**
+ * Strips all markdown tables, replacing them with a notice.
+ */
+function stripTables(markdown) {
+    const lines = markdown.split(/\r?\n/);
+    const result = [];
+    let i = 0;
+    let stripped = false;
+
+    while (i < lines.length) {
+        if (lines[i].includes('|')) {
+            while (i < lines.length && lines[i].includes('|')) i++;
+            if (!stripped) {
+                result.push('> ⚠️ One or more tables were removed due to formatting issues.');
+                stripped = true;
+            }
+        } else {
+            result.push(lines[i]);
+            i++;
+        }
+    }
+
+    return result.join('\n');
 }
 
 /**
@@ -95,11 +127,30 @@ async function resolveImagePath(imagePath, markdownFilePath) {
 }
 
 /**
- * Processes a single markdown file and creates a Notion page under the appropriate folder page.
+ * Appends blocks to an existing page (for folder notes).
+ */
+async function appendBlocksToPage(pageId, blocks) {
+    const chunks = [];
+    for (let i = 0; i < blocks.length; i += 100) {
+        chunks.push(blocks.slice(i, i + 100));
+    }
+    for (const chunk of chunks) {
+        await callWithRetry(() =>
+            notion.blocks.children.append({ block_id: pageId, children: chunk })
+        );
+    }
+}
+
+/**
+ * Processes a single markdown file and creates or updates a Notion page.
+ * If the file is a folder note (same name as parent folder), its content
+ * is written to the folder page itself instead of creating a child page.
  */
 async function processSingleFile(filePath, existingPages) {
     const pageTitle = path.basename(filePath, '.md');
     const relativePath = path.dirname(path.relative(config.markdownBaseDir, filePath));
+    const parentFolderName = relativePath === '.' ? null : path.basename(relativePath);
+    const isFolderNote = parentFolderName && parentFolderName === pageTitle;
     const pageKey = relativePath === '.' ? pageTitle : `${relativePath.replace(/\\/g, '/')}/${pageTitle}`;
 
     if (existingPages.has(pageKey)) {
@@ -108,9 +159,7 @@ async function processSingleFile(filePath, existingPages) {
     }
 
     try {
-        const parentPageId = await getOrCreatePageForPath(relativePath);
-
-        console.log(`Processing: ${pageTitle}`);
+        console.log(`Processing: ${pageTitle}${isFolderNote ? ' (folder note)' : ''}`);
         const rawContent = await fs.readFile(filePath, 'utf8');
         const { frontmatter, body } = parseFrontmatter(rawContent);
         let markdownContent = sanitizeTables(body);
@@ -120,7 +169,6 @@ async function processSingleFile(filePath, existingPages) {
         const attachmentMatches = [...markdownContent.matchAll(attachmentRegex)];
 
         if (attachmentMatches.length > 0) {
-            console.log(`  Found ${attachmentMatches.length} local attachment(s) in ${pageTitle}`);
             const uploadPromises = attachmentMatches.map(match => {
                 return (async () => {
                     const originalLinkText = match[0];
@@ -162,41 +210,71 @@ async function processSingleFile(filePath, existingPages) {
 
             const uploadResults = await Promise.all(uploadPromises);
             for (const result of uploadResults) {
-                if (result) {
-                    markdownContent = markdownContent.replace(result.original, result.replacement);
-                }
+                if (result) markdownContent = markdownContent.replace(result.original, result.replacement);
             }
         }
 
-        const notionBlocks = markdownToBlocks(markdownContent);
-
-        // Prepend frontmatter callout if present
         const callout = buildFrontmatterCallout(frontmatter);
-        const allBlocks = callout ? [callout, ...notionBlocks] : notionBlocks;
 
-        const firstChunk = allBlocks.slice(0, 100);
-        const remainingChunks = [];
-        for (let i = 100; i < allBlocks.length; i += 100) {
-            remainingChunks.push(allBlocks.slice(i, i + 100));
+        async function buildAndSendBlocks(md) {
+            const notionBlocks = markdownToBlocks(md);
+            return callout ? [callout, ...notionBlocks] : notionBlocks;
         }
 
-        const newPage = await callWithRetry(() =>
-            notion.pages.create({
-                parent: { page_id: parentPageId },
-                properties: {
-                    title: [{ text: { content: pageTitle } }],
-                },
-                children: firstChunk,
-            })
-        );
+        if (isFolderNote) {
+            // Write content onto the folder page itself
+            const folderPageId = await getOrCreatePageForPath(relativePath);
+            try {
+                const blocks = await buildAndSendBlocks(markdownContent);
+                await appendBlocksToPage(folderPageId, blocks);
+            } catch (err) {
+                if (err.message && err.message.includes('table')) {
+                    console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
+                    const blocks = await buildAndSendBlocks(stripTables(markdownContent));
+                    await appendBlocksToPage(folderPageId, blocks);
+                } else {
+                    throw err;
+                }
+            }
+        } else {
+            // Create a new child page under the parent
+            const parentPageId = await getOrCreatePageForPath(relativePath);
 
-        for (const chunk of remainingChunks) {
-            await callWithRetry(() =>
-                notion.blocks.children.append({
-                    block_id: newPage.id,
-                    children: chunk,
-                })
-            );
+            async function tryCreatePage(md) {
+                const allBlocks = await buildAndSendBlocks(md);
+                const firstChunk = allBlocks.slice(0, 100);
+                const remainingChunks = [];
+                for (let i = 100; i < allBlocks.length; i += 100) {
+                    remainingChunks.push(allBlocks.slice(i, i + 100));
+                }
+
+                const newPage = await callWithRetry(() =>
+                    notion.pages.create({
+                        parent: { page_id: parentPageId },
+                        properties: {
+                            title: [{ text: { content: pageTitle } }],
+                        },
+                        children: firstChunk,
+                    })
+                );
+
+                for (const chunk of remainingChunks) {
+                    await callWithRetry(() =>
+                        notion.blocks.children.append({ block_id: newPage.id, children: chunk })
+                    );
+                }
+            }
+
+            try {
+                await tryCreatePage(markdownContent);
+            } catch (err) {
+                if (err.message && err.message.includes('table')) {
+                    console.warn(`  ⚠️  Table error in "${pageTitle}", retrying with tables stripped...`);
+                    await tryCreatePage(stripTables(markdownContent));
+                } else {
+                    throw err;
+                }
+            }
         }
 
         console.log(`✅ Synced: ${pageTitle}`);

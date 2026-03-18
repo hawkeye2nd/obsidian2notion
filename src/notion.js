@@ -3,42 +3,46 @@ const { callWithRetry } = require('./utils');
 
 const notion = new Client({ auth: process.env.NOTION_KEY });
 
-const pageCache = new Map();
+// Cache promises (not just results) to prevent race conditions with concurrent requests
+const pagePromiseCache = new Map();
 
 /**
  * Gets or creates a folder page under a given parent.
  */
-async function getOrCreateFolderPage(title, parentPageId) {
+function getOrCreateFolderPage(title, parentPageId) {
     const cacheKey = `${parentPageId}/${title}`;
-    if (pageCache.has(cacheKey)) {
-        return pageCache.get(cacheKey);
+
+    if (pagePromiseCache.has(cacheKey)) {
+        return pagePromiseCache.get(cacheKey);
     }
 
-    const response = await callWithRetry(() =>
-        notion.blocks.children.list({ block_id: parentPageId })
-    );
-    const existing = response.results.find(
-        block => block.type === 'child_page' && block.child_page.title === title
-    );
+    const promise = (async () => {
+        const response = await callWithRetry(() =>
+            notion.blocks.children.list({ block_id: parentPageId })
+        );
+        const existing = response.results.find(
+            block => block.type === 'child_page' && block.child_page.title === title
+        );
 
-    if (existing) {
-        console.log(`  Found existing folder page: "${title}"`);
-        pageCache.set(cacheKey, existing.id);
-        return existing.id;
-    }
+        if (existing) {
+            console.log(`  Found existing folder page: "${title}"`);
+            return existing.id;
+        }
 
-    console.log(`  Creating new folder page: "${title}"`);
-    const newPage = await callWithRetry(() =>
-        notion.pages.create({
-            parent: { page_id: parentPageId },
-            properties: {
-                title: [{ text: { content: title } }],
-            },
-        })
-    );
+        console.log(`  Creating new folder page: "${title}"`);
+        const newPage = await callWithRetry(() =>
+            notion.pages.create({
+                parent: { page_id: parentPageId },
+                properties: {
+                    title: [{ text: { content: title } }],
+                },
+            })
+        );
+        return newPage.id;
+    })();
 
-    pageCache.set(cacheKey, newPage.id);
-    return newPage.id;
+    pagePromiseCache.set(cacheKey, promise);
+    return promise;
 }
 
 /**

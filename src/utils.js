@@ -33,7 +33,7 @@ async function callWithRetry(apiCall, retries = 5) {
  * Skips hidden folders (starting with '.') and any folders in config.excludedFolders.
  */
 async function findMarkdownFiles(dir) {
-    const config = require('./config');
+    const config = require('../config');
     const excluded = config.excludedFolders || [];
     let markdownFiles = [];
     try {
